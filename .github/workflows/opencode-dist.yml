@@ -1,0 +1,376 @@
+name: opencode-dist
+
+on:
+  schedule:
+    - cron: "37 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag (e.g. v2.2.6); leave empty to auto-detect the latest stable v2 release"
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: opencode-dist
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: anomalyco/opencode
+  BUN_VERSION: "1.4.4"
+
+jobs:
+  discover:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.find.outputs.tag }}
+      version: ${{ steps.find.outputs.version }}
+      skip: ${{ steps.find.outputs.skip }}
+    steps:
+      - name: Find the release to build
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+            gh api "repos/$UPSTREAM_REPO/git/ref/tags/$TAG" --jq '.object.sha' >/dev/null
+          else
+            for attempt in 1 2 3; do
+              TAG=$(gh api "repos/$UPSTREAM_REPO/releases?per_page=100" \
+                --jq '.[] | select(.draft|not) | select(.prerelease|not) | .tag_name | select(startswith("v2."))' \
+                | head -n1) && [ -n "$TAG" ] && break
+              [ "$attempt" = 3 ] && { echo "no stable v2 release found upstream" >&2; exit 1; }
+              echo "upstream releases query failed (attempt $attempt), retrying in 15s"
+              sleep 15
+            done
+          fi
+          SKIP=false
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && SKIP=true
+          if [ "$SKIP" = true ] && ! npm view "@me0wo/opencode@${TAG#v}" version >/dev/null 2>&1; then
+            SKIP=false
+          fi
+          {
+            echo "tag=$TAG"
+            echo "version=${TAG#v}"
+            echo "skip=$SKIP"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.skip != 'true'
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64, os: ubuntu-latest, explicit: true, bun-smoke: true, install-flags: "" }
+          - { target: linux-arm64, os: ubuntu-latest, explicit: true, bun-smoke: false, install-flags: "" }
+          - { target: windows-x64, os: ubuntu-latest, explicit: true, bun-smoke: false, install-flags: "" }
+          - { target: windows-arm64, os: ubuntu-latest, explicit: true, bun-smoke: false, install-flags: "" }
+          - { target: darwin-arm64, os: ubuntu-latest, explicit: true, bun-smoke: false, install-flags: "" }
+          - { target: darwin-x64, os: macos-15-intel, explicit: false, bun-smoke: true, skip-install: true, install-flags: "--os=darwin --cpu=x64" }
+    env:
+      OPENCODE_TARGET: ${{ matrix.explicit && matrix.target || '' }}
+      OPENCODE_VERSION: ${{ needs.discover.outputs.version }}
+      OPENCODE_CHANNEL: latest
+      OPENCODE_RELEASE_NOTES: ""
+    steps:
+      - name: Checkout upstream at tag
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.discover.outputs.tag }}
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install setuptools || pip install setuptools || true
+          for attempt in 1 2 3; do
+            bun install --frozen-lockfile ${{ matrix.install-flags }} && break
+            [ "$attempt" = 3 ] && exit 1
+            echo "bun install failed (attempt $attempt), retrying in 15s"
+            sleep 15
+          done
+
+      - name: Fetch models catalog
+        run: bun packages/core/script/update-models-snapshot.ts .cache/models-catalog/api.json
+
+      - name: Add undeclared darwin-x64 native packages
+        if: matrix.skip-install
+        env:
+          INSTALL_FLAGS: ${{ matrix.install-flags }}
+        run: |
+          node -e '
+            const fs = require("fs")
+            const lock = JSON.parse(fs.readFileSync("bun.lock", "utf8").replace(/,\s*([}\]])/g, "$1"))
+            const names = ["@parcel/watcher-darwin-x64", "@ff-labs/fff-bin-darwin-x64", "@yuuang/ffi-rs-darwin-x64"]
+            const specs = names.map((n) => `${n}@${lock.packages[n][0].split("@").at(-1)}`)
+            const flags = (process.env.INSTALL_FLAGS || "").split(" ").filter(Boolean)
+            console.log("adding:", [...flags, ...specs].join(" "))
+            const r = require("child_process").spawnSync("bun", ["add", "--dev", "--exact", ...flags, ...specs], { cwd: "packages/cli", stdio: "inherit" })
+            process.exit(r.status ?? 1)
+          '
+
+      - name: List host native packages
+        if: matrix.skip-install
+        working-directory: packages/cli
+        run: ls node_modules/@parcel node_modules/@lydell node_modules/@ff-labs node_modules/@yuuang 2>&1 || true
+
+      - name: Build JS bundle
+        working-directory: packages/cli
+        run: bun run build:node -- --bundle-only ${{ matrix.skip-install && '--skip-install' || '' }}
+        env:
+          OPENCODE_MODELS_SNAPSHOT: ${{ github.workspace }}/.cache/models-catalog/api.json
+
+      - name: Patch for Bun
+        working-directory: packages/cli/dist-node
+        run: |
+          cat > opencode-sea-shim.mjs <<'EOF'
+          import { createRequire } from "node:module"
+          const req = createRequire(import.meta.url)
+          const nodeModule = req("node:module")
+          export const isSea = () => false
+          export const getAssetKeys = () => []
+          export const getRawAsset = () => {
+            throw new Error("SEA assets are unavailable in the bun-runnable bundle")
+          }
+          export const registerHooks = nodeModule.registerHooks ?? (() => () => {})
+          EOF
+          sed -i.bak 's#from"node:sea"#from"./opencode-sea-shim.mjs"#g' opencode.mjs
+          sed -i.bak 's#{createRequire,registerHooks}from"node:module"#{createRequire}from"node:module";import{registerHooks}from"./opencode-sea-shim.mjs"#g' opencode.mjs
+          sed -i.bak 's#{registerHooks,createRequire}from"node:module"#{createRequire}from"node:module";import{registerHooks}from"./opencode-sea-shim.mjs"#g' opencode.mjs
+          sed -i.bak 's#\.registerHooks({#.registerHooks?.({#g' opencode.mjs
+          rm -f opencode.mjs.bak
+
+      - name: Smoke test with Bun
+        if: matrix.bun-smoke
+        working-directory: packages/cli/dist-node
+        run: |
+          bun opencode.mjs --version
+          bun opencode.mjs --help >/dev/null
+
+      - name: Package
+        working-directory: packages/cli
+        run: |
+          case "${{ matrix.target }}" in
+            linux-x64) os=linux; cpu=x64; libc='["glibc"]' ;;
+            linux-arm64) os=linux; cpu=arm64; libc='["glibc"]' ;;
+            darwin-arm64) os=darwin; cpu=arm64; libc=null ;;
+            darwin-x64) os=darwin; cpu=x64; libc=null ;;
+            windows-x64) os=win32; cpu=x64; libc=null ;;
+            windows-arm64) os=win32; cpu=arm64; libc=null ;;
+          esac
+          effect=$(jq -r '.workspaces.catalog.effect' "${{ github.workspace }}/package.json")
+          jq -n \
+            --arg name "@me0wo/opencode-${{ matrix.target }}" \
+            --arg target "${{ matrix.target }}" \
+            --arg version "${{ needs.discover.outputs.version }}" \
+            --arg os "$os" --arg cpu "$cpu" --arg effect "$effect" --argjson libc "$libc" \
+            '{
+              name: $name,
+              version: $version,
+              description: ("OpenCode V2 JS bundle for " + $target + "; runs with your own bun (>= 1.4.4) or Node >= 26"),
+              license: "MIT",
+              repository: {type: "git", url: "git+https://github.com/Sn0wo2/opencode-dist.git"},
+              os: [$os],
+              cpu: [$cpu],
+              libc: $libc,
+              dependencies: {effect: $effect, "@opencode/plugin": "2"},
+              publishConfig: {access: "public"}
+            } | with_entries(select(.value != null))' > dist-node/package.json
+          (cd dist-node && zip -qry "${{ github.workspace }}/opencode-node-${{ matrix.target }}-${{ needs.discover.outputs.tag }}.zip" .)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: opencode-node-*.zip
+          if-no-files-found: error
+
+  verify:
+    needs: build
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64, os: ubuntu-latest }
+          - { target: linux-arm64, os: ubuntu-24.04-arm }
+          - { target: windows-x64, os: windows-latest }
+          - { target: windows-arm64, os: windows-11-arm }
+          - { target: darwin-arm64, os: macos-latest }
+          - { target: darwin-x64, os: macos-15-intel }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "26"
+
+      - name: Extract
+        shell: bash
+        run: |
+          mkdir oc
+          case "$RUNNER_OS" in
+            Windows) /c/Windows/System32/tar.exe -xf dist/*.zip -C oc ;;
+            *) unzip -q dist/*.zip -d oc ;;
+          esac
+
+      - name: Smoke with Bun on native platform
+        working-directory: oc
+        shell: bash
+        run: |
+          bun opencode.mjs --version
+          bun opencode.mjs --help >/dev/null
+
+      - name: Smoke in npm-style layout with bun and node
+        working-directory: oc
+        shell: bash
+        run: |
+          mkdir -p nest/node_modules/@me0wo/opencode-${{ matrix.target }}
+          mv assets opencode.mjs opencode-sea-shim.mjs package.json nest/node_modules/@me0wo/opencode-${{ matrix.target }}/
+          cd nest/node_modules/@me0wo/opencode-${{ matrix.target }}
+          bun install
+          bun opencode.mjs --version
+          node opencode.mjs --version
+
+  release:
+    needs: [discover, build, verify]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.verify.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out pipeline
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: out
+
+      - name: Tag the pipeline commit
+        run: git tag "${{ needs.discover.outputs.tag }}"
+
+      - name: Create the GitHub release
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  npm-publish:
+    needs: [discover, build, verify]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.verify.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.discover.outputs.version }}
+    steps:
+      - name: Check out pipeline
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: out
+
+      - name: Stage packages
+        run: |
+          set -euo pipefail
+          mkdir stage
+          for target in linux-x64 linux-arm64 darwin-arm64 darwin-x64 windows-x64 windows-arm64; do
+            mkdir -p "stage/@me0wo/opencode-$target"
+            unzip -q "out/opencode-node-$target-v${VERSION}.zip" -d "stage/@me0wo/opencode-$target"
+          done
+          mkdir -p stage/@me0wo/opencode/bin
+          cp npm/cli.mjs stage/@me0wo/opencode/bin/cli.mjs
+          cp npm/README.md stage/@me0wo/opencode/README.md
+          jq -n --arg version "$VERSION" '{
+            name: "@me0wo/opencode",
+            version: $version,
+            description: "OpenCode V2 JS bundle (bun/node-runnable); unofficial build from upstream stable tags",
+            license: "MIT",
+            bin: {"opencode-node": "bin/cli.mjs"},
+            files: ["bin/"],
+            optionalDependencies: {
+              "@me0wo/opencode-linux-x64": $version,
+              "@me0wo/opencode-linux-arm64": $version,
+              "@me0wo/opencode-darwin-arm64": $version,
+              "@me0wo/opencode-darwin-x64": $version,
+              "@me0wo/opencode-windows-x64": $version,
+              "@me0wo/opencode-windows-arm64": $version
+            },
+            engines: {node: ">=26"},
+            repository: {type: "git", url: "git+https://github.com/Sn0wo2/opencode-dist.git"},
+            keywords: ["opencode", "opencode2", "ai", "agent", "cli"],
+            publishConfig: {access: "public"}
+          }' > stage/@me0wo/opencode/package.json
+
+      - name: Publish to npm
+        run: |
+          set -euo pipefail
+          publish() {
+            name=$(jq -r .name package.json)
+            version=$(jq -r .version package.json)
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "already on npm: $name@$version"
+              return 0
+            fi
+            for attempt in 1 2 3; do
+              npm publish --provenance && return 0
+              [ "$attempt" = 3 ] && return 1
+              echo "npm publish failed (attempt $attempt), retrying in 15s (ENEEDAUTH usually means no Trusted Publisher is configured on npmjs for this package)"
+              sleep 15
+            done
+          }
+          for dir in stage/@me0wo/opencode-*; do
+            (cd "$dir" && publish)
+          done
+          (cd stage/@me0wo/opencode && publish)

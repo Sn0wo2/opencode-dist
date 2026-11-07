@@ -1,0 +1,41 @@
+version: 2
+project_name: opencode-node
+
+builds:
+  - id: app
+    skip: true
+
+checksum:
+  name_template: checksums.txt
+  extra_files:
+    - glob: ./out/*.zip
+
+snapshot:
+  version_template: "{{ .Version }}-next"
+
+changelog:
+  disable: true
+
+release:
+  prerelease: auto
+  replace_existing_artifacts: true
+  extra_files:
+    - glob: ./out/*.zip
+  header: |
+    JS bundle of [anomalyco/opencode](https://github.com/anomalyco/opencode) `{{ .Tag }}`: no runtime embedded, runs with your own [bun](https://bun.sh) (>= 1.4.4) or Node >= 26.
+
+    ```sh
+    unzip opencode-node-windows-x64-{{ .Tag }}.zip -d opencode
+    bun opencode/opencode.mjs --version
+    ```
+
+    Or install from npm:
+
+    ```sh
+    npm i -g @me0wo/opencode
+    opencode-node --version
+    ```
+    {{- if .Prerelease }}
+
+    > ⚠️ **WARNING: This is a pre-release version and is not recommended for production use.**
+    {{- end }}
